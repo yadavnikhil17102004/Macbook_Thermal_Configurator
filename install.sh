@@ -49,7 +49,7 @@ chmod +x "$INSTALL_PATH"
 ok "Made executable."
 
 # ── Step 4: Add alias to shell config ────────────────────────────────────────
-ALIAS_LINE="alias modes='sudo $INSTALL_PATH'"
+ALIAS_LINE="alias modes='sudo \"$INSTALL_PATH\"'"
 SHELL_CONFIG=""
 
 if [[ "$SHELL" == *"zsh"* ]] || [[ -f "$HOME/.zshrc" ]]; then
@@ -60,17 +60,23 @@ else
   SHELL_CONFIG="$HOME/.profile"
 fi
 
+# Check for existence of any alias named 'modes'
 if grep -qF "alias modes=" "$SHELL_CONFIG" 2>/dev/null; then
   warn "Alias 'modes' already exists in $SHELL_CONFIG. Skipping."
 else
-  echo "" >> "$SHELL_CONFIG"
-  echo "# Mac Thermal Manager — https://github.com/yadavnikhil17102004/Macbook_Thermal_Configurator" >> "$SHELL_CONFIG"
-  echo "$ALIAS_LINE" >> "$SHELL_CONFIG"
+  {
+    echo ""
+    echo "# Mac Thermal Manager — https://github.com/yadavnikhil17102004/Macbook_Thermal_Configurator"
+    echo "$ALIAS_LINE"
+  } >> "$SHELL_CONFIG"
   ok "Alias added to $SHELL_CONFIG"
 fi
 
 # ── Step 5: Add ~/bin to PATH if not already there ───────────────────────────
 if ! echo "$PATH" | grep -q "$HOME/bin"; then
+  # Single quotes are intentional: $HOME must expand when the user sources
+  # their shell config, not at install time.
+  # shellcheck disable=SC2016
   echo 'export PATH="$HOME/bin:$PATH"' >> "$SHELL_CONFIG"
   ok "Added ~/bin to PATH in $SHELL_CONFIG"
 fi

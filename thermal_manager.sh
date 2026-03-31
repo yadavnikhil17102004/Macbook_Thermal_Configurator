@@ -7,8 +7,28 @@
 #  Req    : sudo — uses only built-in macOS tools + optional blueutil
 # =============================================================================
 
-VERSION="2.0.0"
+VERSION="2.1.0"
+DRY_RUN=false
 set -euo pipefail
+
+# ── Platform guard ────────────────────────────────────────────────────────────
+check_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo -e "  \033[0;31m✗\033[0m This script requires macOS. Detected OS: $(uname -s)"
+    exit 1
+  fi
+}
+
+# ── Dry-run command wrapper ───────────────────────────────────────────────────
+# Usage: xcmd sudo pmset -a gpuswitch 0
+# In dry-run mode: prints the command instead of executing it.
+xcmd() {
+  if [[ "$DRY_RUN" == true ]]; then
+    echo -e "  ${DIM}[dry-run]${RESET} $*"
+  else
+    "$@"
+  fi
+}
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -36,11 +56,23 @@ cleanup_sudo() {
 }
 
 require_sudo() {
+  if [[ "$DRY_RUN" == true ]]; then
+    info "Running in DRY-RUN mode. Sudo not required."
+    return 0
+  fi
+
   if ! sudo -n true 2>/dev/null; then
     echo -e "\n${YELLOW}Thermal controls require sudo.${RESET}"
     sudo -v || { err "Authentication failed."; exit 1; }
   fi
-  ( while true; do sudo -v; sleep 30; done ) &
+
+  # Sudo refresh loop with 8-hour ceiling (28800s)
+  (
+    for ((i=0; i<960; i++)); do
+      sudo -v
+      sleep 30
+    done
+  ) &
   SUDO_KEEPALIVE_PID=$!
   trap cleanup_sudo EXIT INT TERM
 }
@@ -112,8 +144,10 @@ set_gpu_mode() {
     return 0
   fi
 
-  sudo pmset -a gpuswitch "$mode"
+  xcmd sudo pmset -a gpuswitch "$mode"
   sleep 2
+
+  [[ "$DRY_RUN" == true ]] && return 0
 
   # Verify with up to 3 retries
   local retries=3
@@ -125,7 +159,7 @@ set_gpu_mode() {
       return 0
     fi
     warn "GPU state mismatch (expected=$mode, got=${current:-?}). Retrying... ($retries left)"
-    sudo pmset -a gpuswitch "$mode"
+    xcmd sudo pmset -a gpuswitch "$mode"
     sleep 2
     (( retries-- ))
   done
@@ -134,9 +168,6 @@ set_gpu_mode() {
 }
 
 # ── AI / ML daemon management ────────────────────────────────────────────────
-# Confirmed running on this hardware (from system probe):
-#   mediaanalysisd, knowledge-agent, suggestd, parsecd, coreduetd,
-#   UsageTrackingAgent, routined
 KNOWN_AI_DAEMONS=(
   "mediaanalysisd"      # Photos/video ML frame analysis
   "knowledge-agent"     # CoreML on-device learning (Siri intelligence)
@@ -147,7 +178,6 @@ KNOWN_AI_DAEMONS=(
   "routined"            # Location + routine ML model
 )
 
-# Corresponding LaunchAgent bundle IDs for launchctl
 AI_DAEMON_PLISTS=(
   "com.apple.mediaanalysisd"
   "com.apple.knowledge-agent"
@@ -168,12 +198,12 @@ kill_ai_daemons() {
     pids=$(pgrep -x "$daemon" 2>/dev/null || true)
 
     if [[ -n "$pids" ]]; then
-      # Step 1: Signal via launchctl (user domain — prevents immediate respawn)
-      launchctl kill SIGTERM "gui/$(id -u)/${plist}" 2>/dev/null || true
+      # Step 1: Signal via launchctl (user domain)
+      xcmd launchctl kill SIGTERM "gui/$(id -u)/${plist}" 2>/dev/null || true
 
-      # Step 2: Direct kill as fallback / for system-level daemons
+      # Step 2: Direct kill as fallback
       for pid in $pids; do
-        if sudo kill -TERM "$pid" 2>/dev/null; then
+        if xcmd sudo kill -TERM "$pid" 2>/dev/null; then
           ok "Killed ${daemon} (PID ${pid})"
           KILLED_DAEMONS+=("$daemon")
           killed=$(( killed + 1 ))
@@ -182,17 +212,19 @@ kill_ai_daemons() {
         fi
       done
 
-      # Step 3: renice any survivors (respawned instances get deprioritized)
+      # Step 3: renice any survivors
       sleep 0.5
       local new_pids
       new_pids=$(pgrep -x "$daemon" 2>/dev/null || true)
       for pid in $new_pids; do
-        sudo renice 15 "$pid" 2>/dev/null && ok "Reniced ${daemon} (PID ${pid}) → nice=15" || true
+        if xcmd sudo renice 15 "$pid" 2>/dev/null; then
+          ok "Reniced ${daemon} (PID ${pid}) → nice=15"
+        fi
       done
     fi
   done
 
-  if [[ $killed -eq 0 ]]; then
+  if [[ "$killed" -eq 0 ]]; then
     info "No AI daemons found running."
   else
     ok "${killed} AI daemon(s) terminated."
@@ -221,28 +253,28 @@ throttle_background_processes() {
     pids=$(pgrep -if "$proc" 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
       for pid in $pids; do
-        sudo taskpolicy -b -p "$pid" 2>/dev/null && {
+        if xcmd sudo taskpolicy -b -p "$pid" 2>/dev/null; then
           ok "Background QoS: ${proc} (PID ${pid})"
-          (( throttled++ ))
-        } || true
+          throttled=$(( throttled + 1 ))
+        fi
       done
     fi
   done
-  [[ $throttled -eq 0 ]] && info "No background QoS targets found running."
+  [[ "$throttled" -eq 0 ]] && info "No background QoS targets found running."
 }
 
 # ── Memory flush ──────────────────────────────────────────────────────────────
-# Clears inactive memory pages and disk cache.
-# Reduces the likelihood of swap activity, which causes NVMe I/O → heat.
 flush_memory() {
   local before_pages before_mb freed_mb
+  # shellcheck disable=SC2006
   before_pages=$(vm_stat | awk '/Pages inactive/{gsub(/\./,"",$3); print $3}')
   before_mb=$(( (before_pages * 4096) / 1024 / 1024 ))
 
-  sudo purge
+  xcmd sudo purge
   sleep 1
 
   local after_pages after_mb
+  # shellcheck disable=SC2006
   after_pages=$(vm_stat | awk '/Pages inactive/{gsub(/\./,"",$3); print $3}')
   after_mb=$(( (after_pages * 4096) / 1024 / 1024 ))
   freed_mb=$(( before_mb - after_mb ))
@@ -253,40 +285,60 @@ flush_memory() {
 # ── Spotlight — kill + disable ────────────────────────────────────────────────
 kill_spotlight() {
   # Kill running indexers first (immediate heat reduction)
-  sudo killall mds mds_stores mdworker_shared 2>/dev/null || true
+  xcmd sudo killall mds mds_stores mdworker_shared 2>/dev/null || true
   sleep 0.5
-  sudo mdutil -a -i off 2>/dev/null && ok "Spotlight indexing disabled (all volumes)." \
-    || warn "Spotlight control limited (SIP may be blocking). Continuing."
+  if xcmd sudo mdutil -a -i off 2>/dev/null; then
+    ok "Spotlight indexing disabled (all volumes)."
+  else
+    warn "Spotlight control limited (SIP may be blocking). Continuing."
+  fi
 }
 
 # ── Time Machine — version-aware ─────────────────────────────────────────────
 disable_timemachine() {
   if [[ "$MACOS_VERSION" -ge 12 ]]; then
-    sudo tmutil disable 2>/dev/null && ok "Time Machine disabled." \
-      || warn "tmutil disable unavailable (already off or restricted)."
+    if xcmd sudo tmutil disable 2>/dev/null; then
+      ok "Time Machine disabled."
+    else
+      warn "tmutil disable unavailable (already off or restricted)."
+    fi
   else
-    sudo tmutil disablelocal 2>/dev/null || sudo tmutil disable 2>/dev/null \
-      && ok "Time Machine disabled." || warn "tmutil unavailable. Skipping."
+    if xcmd sudo tmutil disablelocal 2>/dev/null || xcmd sudo tmutil disable 2>/dev/null; then
+      ok "Time Machine disabled."
+    else
+      warn "tmutil unavailable. Skipping."
+    fi
   fi
 }
 
 enable_timemachine() {
-  sudo tmutil enable 2>/dev/null && ok "Time Machine re-enabled." || warn "tmutil enable unavailable."
+  if xcmd sudo tmutil enable 2>/dev/null; then
+    ok "Time Machine re-enabled."
+  else
+    warn "tmutil enable unavailable."
+  fi
 }
 
 # ── Radio control (WiFi + Bluetooth) ─────────────────────────────────────────
 disable_radios() {
   # WiFi
   if [[ -n "$WIFI_IF" ]]; then
-    sudo networksetup -setairportpower "$WIFI_IF" off 2>/dev/null \
-      && ok "WiFi disabled (${WIFI_IF})." || warn "Could not disable WiFi."
+    if xcmd sudo networksetup -setairportpower "$WIFI_IF" off 2>/dev/null; then
+      ok "WiFi disabled (${WIFI_IF})."
+    else
+      warn "Could not disable WiFi."
+    fi
   else
     warn "WiFi interface not found."
   fi
 
   # Bluetooth (optional — needs blueutil)
   if command -v blueutil &>/dev/null; then
-    blueutil -p 0 && ok "Bluetooth disabled." || warn "blueutil: Bluetooth disable failed."
+    if xcmd blueutil -p 0; then
+      ok "Bluetooth disabled."
+    else
+      warn "blueutil: Bluetooth disable failed."
+    fi
   else
     warn "Bluetooth still active. Install blueutil: brew install blueutil"
   fi
@@ -294,24 +346,34 @@ disable_radios() {
 
 enable_radios() {
   if [[ -n "$WIFI_IF" ]]; then
-    sudo networksetup -setairportpower "$WIFI_IF" on 2>/dev/null \
-      && ok "WiFi re-enabled (${WIFI_IF})." || warn "Could not re-enable WiFi."
+    if xcmd sudo networksetup -setairportpower "$WIFI_IF" on 2>/dev/null; then
+      ok "WiFi re-enabled (${WIFI_IF})."
+    else
+      warn "Could not re-enable WiFi."
+    fi
   fi
   if command -v blueutil &>/dev/null; then
-    blueutil -p 1 && ok "Bluetooth re-enabled." || true
+    if xcmd blueutil -p 1; then
+      ok "Bluetooth re-enabled."
+    fi
   fi
 }
 
 # ── LaunchAgent management ────────────────────────────────────────────────────
 unload_agent() {
   local plist="$1"
-  launchctl unload -w "${plist}" 2>/dev/null && ok "Unloaded: $(basename "$plist" .plist)" \
-    || warn "Could not unload: $(basename "$plist" .plist) (may be SIP-protected or absent)"
+  if xcmd launchctl unload -w "${plist}" 2>/dev/null; then
+    ok "Unloaded: $(basename "$plist" .plist)"
+  else
+    warn "Could not unload: $(basename "$plist" .plist) (may be SIP-protected or absent)"
+  fi
 }
 
 load_agent() {
   local plist="$1"
-  launchctl load -w "${plist}" 2>/dev/null && ok "Loaded: $(basename "$plist" .plist)" || true
+  if xcmd launchctl load -w "${plist}" 2>/dev/null; then
+    ok "Loaded: $(basename "$plist" .plist)"
+  fi
 }
 
 LA="/System/Library/LaunchAgents"
@@ -321,7 +383,6 @@ LA="/System/Library/LaunchAgents"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── ICEBERG — Absolute maximum cooling ───────────────────────────────────────
-# Every available software lever pulled. Network goes offline.
 apply_iceberg() {
   step "1/10" "GPU → iGPU only"
   set_gpu_mode 0
@@ -345,24 +406,21 @@ apply_iceberg() {
   disable_timemachine
 
   step "8/10" "Power Management → Maximum suppression"
-  sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0 sleep 0
+  xcmd sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0 sleep 0
   ok "Sleep=0, PowerNap=0, Standby=0."
 
   step "9/10" "UI Compositor → Minimal"
-  defaults write com.apple.universalaccess reduceMotion -bool true
-  defaults write com.apple.universalaccess reduceTransparency -bool true
+  xcmd defaults write com.apple.universalaccess reduceMotion -bool true
+  xcmd defaults write com.apple.universalaccess reduceTransparency -bool true
   ok "Motion + Transparency disabled."
 
   step "10/10" "CPU Turbo hint → Efficiency preference"
-  # machdep.xcpm.perf_hint: 0=max perf, 3=balanced/efficiency
-  sudo sysctl -w machdep.xcpm.perf_hint=3 2>/dev/null \
+  xcmd sudo sysctl -w machdep.xcpm.perf_hint=3 2>/dev/null \
     && ok "CPU efficiency hint applied." \
     || warn "machdep.xcpm.perf_hint unavailable on this macOS version."
 
   echo -e "\n${BLUE}${BOLD}  ❄❄❄  ICEBERG — Maximum cooling active.${RESET}"
   warn "Network is OFFLINE. Run 'restore' to re-enable WiFi."
-  echo -e "  ${DIM}AI daemons killed, Background QoS enforced, memory flushed.${RESET}"
-  echo -e "  ${DIM}Expected: CPU junction temp ≤ 55°C at idle.${RESET}"
 }
 
 # ── CHILL — Light work / video ────────────────────────────────────────────────
@@ -377,7 +435,7 @@ apply_chill() {
   flush_memory
 
   step "4/8" "Power Management → Suppress background wakeups"
-  sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0
+  xcmd sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0
   ok "PowerNap / Standby / SMS disabled."
 
   step "5/8" "Spotlight → Pause"
@@ -390,13 +448,11 @@ apply_chill() {
   throttle_background_processes
 
   step "8/8" "UI Compositor → Reduce"
-  defaults write com.apple.universalaccess reduceMotion -bool true
-  defaults write com.apple.universalaccess reduceTransparency -bool true
+  xcmd defaults write com.apple.universalaccess reduceMotion -bool true
+  xcmd defaults write com.apple.universalaccess reduceTransparency -bool true
   ok "Motion + Transparency reduced."
 
   echo -e "\n${GREEN}${BOLD}  ❄  CHILL mode active.${RESET}"
-  echo -e "  Target: CPU ≤ 60°C during video playback."
-  warn "For video: use Safari (hardware decode). Chrome activates dGPU."
 }
 
 # ── PROGRAMMING — Code editors / compilers ────────────────────────────────────
@@ -411,20 +467,22 @@ apply_programming() {
   flush_memory
 
   step "4/6" "Power Management → CPU headroom"
-  sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0
+  xcmd sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0
   ok "Background wakeups suppressed."
 
   step "5/6" "Spotlight → Re-enable (needed for code search)"
-  sudo mdutil -a -i on 2>/dev/null && ok "Spotlight on." || warn "Could not enable Spotlight."
+  if xcmd sudo mdutil -a -i on 2>/dev/null; then
+    ok "Spotlight on."
+  else
+    warn "Could not enable Spotlight."
+  fi
 
   step "6/6" "UI Compositor → Balanced"
-  defaults write com.apple.universalaccess reduceMotion -bool true
-  defaults write com.apple.universalaccess reduceTransparency -bool false
+  xcmd defaults write com.apple.universalaccess reduceMotion -bool true
+  xcmd defaults write com.apple.universalaccess reduceTransparency -bool false
   ok "Motion reduced. Transparency kept (editor contrast)."
 
   echo -e "\n${GREEN}${BOLD}  💻  PROGRAMMING mode active.${RESET}"
-  echo -e "  Turbo Boost: ON — compiler bursts welcome."
-  echo -e "  AI daemons: killed. Memory: flushed. GPU: Auto."
 }
 
 # ── BEAST — Maximum raw performance ──────────────────────────────────────────
@@ -439,7 +497,7 @@ apply_beast() {
   flush_memory
 
   step "4/7" "Power Management → Max headroom"
-  sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0 sleep 0
+  xcmd sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0 sleep 0
   ok "Sleep disabled. Machine stays awake."
 
   step "5/7" "Spotlight → Disable (I/O competition)"
@@ -449,15 +507,11 @@ apply_beast() {
   disable_timemachine
 
   step "7/7" "UI Compositor → Minimal"
-  defaults write com.apple.universalaccess reduceMotion -bool true
-  defaults write com.apple.universalaccess reduceTransparency -bool true
+  xcmd defaults write com.apple.universalaccess reduceMotion -bool true
+  xcmd defaults write com.apple.universalaccess reduceTransparency -bool true
   ok "Motion + Transparency disabled."
 
   echo -e "\n${RED}${BOLD}  ⚡  BEAST mode active.${RESET}"
-  warn "CPU at full Turbo Boost. Monitor:"
-  echo -e "  ${DIM}sudo powermetrics --samplers smc -i 1000 | grep 'CPU die'${RESET}"
-  warn "Plug into RIGHT-SIDE USB-C port only."
-  warn "If CPU die > 95°C sustained, kernel_task WILL throttle. That is the hardware floor."
 }
 
 # ── MARATHON — Long tasks / stable thermals ───────────────────────────────────
@@ -475,7 +529,7 @@ apply_marathon() {
   flush_memory
 
   step "5/9" "Power Management → No interruptions"
-  sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0 sleep 0
+  xcmd sudo pmset -a powernap 0 standby 0 hibernatemode 0 sms 0 sleep 0
   ok "Machine will not sleep."
 
   step "6/9" "Spotlight → Disable"
@@ -489,13 +543,11 @@ apply_marathon() {
   unload_agent "${LA}/com.apple.gamed.plist"
 
   step "9/9" "UI Compositor → Minimal"
-  defaults write com.apple.universalaccess reduceMotion -bool true
-  defaults write com.apple.universalaccess reduceTransparency -bool true
+  xcmd defaults write com.apple.universalaccess reduceMotion -bool true
+  xcmd defaults write com.apple.universalaccess reduceTransparency -bool true
   ok "UI impact minimized."
 
   echo -e "\n${YELLOW}${BOLD}  🕰  MARATHON mode active.${RESET}"
-  echo -e "  Philosophy: stable 75–80°C sustained > 95°C spike → throttle cycle."
-  echo -e "  Monitor: ${DIM}sudo powermetrics --samplers smc,cpu_power -i 3000 | grep -E 'CPU die|Fan'${RESET}"
 }
 
 # ── RESTORE — Return to macOS defaults ───────────────────────────────────────
@@ -507,11 +559,13 @@ apply_restore() {
   enable_radios
 
   step "3/7" "pmset → Restore macOS defaults"
-  sudo pmset -a powernap 1 standby 1 hibernatemode 3 sms 1 sleep 1
+  xcmd sudo pmset -a powernap 1 standby 1 hibernatemode 3 sms 1 sleep 1
   ok "Power management restored."
 
   step "4/7" "Spotlight → Re-enable"
-  sudo mdutil -a -i on 2>/dev/null && ok "Spotlight indexing on." || warn "Spotlight restore skipped."
+  if xcmd sudo mdutil -a -i on 2>/dev/null; then
+    ok "Spotlight indexing on."
+  fi
 
   step "5/7" "Time Machine → Re-enable"
   enable_timemachine
@@ -521,16 +575,11 @@ apply_restore() {
   load_agent "${LA}/com.apple.gamed.plist"
 
   step "7/7" "UI Compositor → Restore defaults"
-  defaults write com.apple.universalaccess reduceMotion -bool false
-  defaults write com.apple.universalaccess reduceTransparency -bool false
+  xcmd defaults write com.apple.universalaccess reduceMotion -bool false
+  xcmd defaults write com.apple.universalaccess reduceTransparency -bool false
   ok "Motion + Transparency restored."
 
   echo -e "\n${GREEN}${BOLD}  🔄  System restored to macOS defaults.${RESET}"
-  if [[ ${#KILLED_DAEMONS[@]} -gt 0 ]]; then
-    info "AI daemons killed this session: ${KILLED_DAEMONS[*]}"
-    info "They will respawn on next login or launchd trigger."
-  fi
-  warn "CPU Turbo hint: if you applied ICEBERG, reboot to fully reset xcpm hint."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -685,7 +734,7 @@ show_monitor() {
   warn "Sampling: CPU/GPU temp, fan speeds, power draw, throttle events."
   echo -e "  ${DIM}Starting in 2s...${RESET}\n"
   sleep 2
-  sudo powermetrics \
+  xcmd sudo powermetrics \
     --samplers smc,cpu_power,gpu_power \
     -i 2000 \
     2>/dev/null \
@@ -693,6 +742,41 @@ show_monitor() {
     | while IFS= read -r line; do
         echo -e "  ${DIM}$(date +%H:%M:%S)${RESET}  $line"
       done
+}
+
+# ── Status snapshot (No sudo needed) ──────────────────────────────────────────
+show_status() {
+  sep
+  echo -ne "${BOLD}  Current Configuration Snapshot${RESET}\n"
+  sep
+
+  local gpuswitch standby powernap hibernatemode sleep_val sms_val motion transparency
+
+  # shellcheck disable=SC2006
+  gpuswitch=$(pmset -g | grep gpuswitch | awk '{print $2}' || echo "N/A")
+  # shellcheck disable=SC2006
+  standby=$(pmset -g | grep -w standby | awk '{print $2}' || echo "N/A")
+  # shellcheck disable=SC2006
+  powernap=$(pmset -g | grep -w powernap | awk '{print $2}' || echo "N/A")
+  # shellcheck disable=SC2006
+  hibernatemode=$(pmset -g | grep -w hibernatemode | awk '{print $2}' || echo "N/A")
+  # shellcheck disable=SC2006
+  sleep_val=$(pmset -g | grep -w " sleep" | awk '{print $2}' | head -1 || echo "N/A")
+  # shellcheck disable=SC2006
+  sms_val=$(pmset -g | grep -w sms | awk '{print $2}' || echo "N/A")
+
+  motion=$(defaults read com.apple.universalaccess reduceMotion 2>/dev/null || echo "0")
+  transparency=$(defaults read com.apple.universalaccess reduceTransparency 2>/dev/null || echo "0")
+
+  echo -e "  GPU Switch   : $([[ "$gpuswitch" == 0 ]] && echo -e "${BLUE}iGPU Only${RESET}" || echo "Auto/dGPU")"
+  echo -e "  PowerNap     : $([[ "$powernap" == 0 ]] && echo -e "${GREEN}OFF${RESET}" || echo -e "${YELLOW}ON${RESET}")"
+  echo -e "  Standby      : $([[ "$standby" == 0 ]] && echo -e "${GREEN}OFF${RESET}" || echo -e "${YELLOW}ON${RESET}")"
+  echo -e "  Hibernatemode: $hibernatemode"
+  echo -e "  Sleep Timer  : $([[ "$sleep_val" == 0 ]] && echo -e "${GREEN}Disabled (0)${RESET}" || echo "$sleep_val min")"
+  echo -e "  SMS (Sensor) : $([[ "$sms_val" == 0 ]] && echo -e "${GREEN}OFF${RESET}" || echo -e "${YELLOW}ON${RESET}")"
+  echo -e "  ReduceMotion : $([[ "$motion" == 1 ]] && echo -e "${GREEN}Enabled${RESET}" || echo "Disabled")"
+  echo -e "  ReduceTransp : $([[ "$transparency" == 1 ]] && echo -e "${GREEN}Enabled${RESET}" || echo "Disabled")"
+  sep
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -720,88 +804,103 @@ MODES:
   restore       🔄   Reset ALL settings to macOS defaults + re-enable radios
 
 OPTIONS:
-  --help        Show this help
+  --help | -h   Show this help
   --version     Show version
+  --status      Snapshot of current config (no sudo needed)
+  --dry-run | -n  Preview commands without making changes
 
-NEW IN v2.0:
-  • ICEBERG mode — WiFi+BT off, all AI daemons killed, Background QoS, memory purge
-  • AUDIT mode   — Live sensors, battery health, throttle detection, daemon scan
-  • AI daemons   — 7 confirmed heat sources killed per mode
-  • taskpolicy   — Background QoS for Electron/Dropbox/Chrome Helper
-  • renice 15    — Deprioritizes any AI daemon that respawns
-  • memory purge — Reduces swap I/O thermal load
-  • GPU retry    — Verification loop (3 retries) with actual state check
-  • Radio restore — WiFi + Bluetooth re-enabled by restore mode
-
-KILLED DAEMONS (per mode):
-  mediaanalysisd · knowledge-agent · suggestd · parsecd
-  coreduetd · UsageTrackingAgent · routined
-
-ONE-LINER (no download):
-  bash <(curl -fsSL https://raw.githubusercontent.com/yadavnikhil17102004/Macbook_Thermal_Configurator/main/thermal_manager.sh)
-
-INSTALL (adds 'modes' alias):
-  bash <(curl -fsSL https://raw.githubusercontent.com/yadavnikhil17102004/Macbook_Thermal_Configurator/main/install.sh)
+EXAMPLES:
+  sudo ./thermal_manager.sh iceberg
+  ./thermal_manager.sh --status
+  ./thermal_manager.sh --dry-run chill
 
 EOF
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN MENU
-# ─────────────────────────────────────────────────────────────────────────────
-main_menu() {
-  clear
-  echo ""
+show_header() {
   echo -e "${BOLD}${CYAN}  ╔═══════════════════════════════════════════════════╗${RESET}"
-  echo -e "${BOLD}${CYAN}  ║   MacBook Thermal Manager v2.0 — Intelligence     ║${RESET}"
+  echo -e "${BOLD}${CYAN}  ║   MacBook Thermal Manager v${VERSION} — Intelligence     ║${RESET}"
   echo -e "${BOLD}${CYAN}  ║   Intel i7 / AMD Radeon 555X (A1990)              ║${RESET}"
   echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════════════════════════╝${RESET}"
   echo ""
-  show_current_state
-
-  echo -e "  ${BOLD}Select Mode:${RESET}\n"
-  echo -e "  ${BLUE}[1]${RESET}  ❄❄❄  ICEBERG      — ${DIM}Radios OFF, AI killed, QoS, purge${RESET}"
-  echo -e "  ${GREEN}[2]${RESET}  ❄    Chill        — ${DIM}iGPU, AI killed, Spotlight off${RESET}"
-  echo -e "  ${BLUE}[3]${RESET}  💻   Programming  — ${DIM}Auto GPU, AI killed, Spotlight on${RESET}"
-  echo -e "  ${RED}[4]${RESET}  ⚡   Beast         — ${DIM}dGPU auto, sleep=0, AI killed${RESET}"
-  echo -e "  ${YELLOW}[5]${RESET}  🕰   Marathon      — ${DIM}iGPU, QoS enforced, stable temps${RESET}"
-  echo -e "  ${MAGENTA}[6]${RESET}  📊   AUDIT         — ${DIM}Battery health, throttle detection, sensor scan${RESET}"
-  echo -e "  ${DIM}[7]${RESET}  📈   Monitor       — ${DIM}Live thermal dashboard${RESET}"
-  echo -e "  ${DIM}[8]${RESET}  🔄   Restore       — ${DIM}Reset to macOS defaults + re-enable radios${RESET}"
-  echo -e "  ${DIM}[0]${RESET}  ✗    Exit"
-  echo ""
-  echo -ne "  ${BOLD}Choice [0-8]:${RESET} "
-  read -r choice
-
-  # Sanitize: accept only 0-8
-  choice="${choice//[^0-8]/}"
-  [[ -z "$choice" ]] && choice=9
-
-  case "$choice" in
-    1) sep; apply_iceberg ;;
-    2) sep; apply_chill ;;
-    3) sep; apply_programming ;;
-    4) sep; apply_beast ;;
-    5) sep; apply_marathon ;;
-    6) run_audit ;;
-    7) show_monitor ;;
-    8) sep; apply_restore ;;
-    0) echo -e "\n  Bye.\n"; cleanup_sudo; exit 0 ;;
-    *) warn "Invalid choice."; sleep 1; main_menu; return ;;
-  esac
-
-  echo ""
-  sep
-  echo -ne "\n  ${DIM}Press Enter to return to menu, or Ctrl+C to exit...${RESET}"
-  read -r
-  main_menu
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CLI MODE
-# ─────────────────────────────────────────────────────────────────────────────
-cli_mode() {
-  case "$1" in
+# ── Main Menu ─────────────────────────────────────────────────────────────────
+main_menu() {
+  while true; do
+    clear
+    echo ""
+    show_header
+    [[ "$DRY_RUN" == true ]] && echo -e "  ${YELLOW}${BOLD}⚠ DRY-RUN mode active — no system changes will be pushed.${RESET}\n"
+    show_current_state
+
+    echo -e "  ${BOLD}Select Optimization Mode:${RESET}\n"
+    echo -e "  ${BLUE}[1]${RESET}  ❄❄❄  ICEBERG      — ${DIM}Radios OFF, AI killed, QoS, purge${RESET}"
+    echo -e "  ${GREEN}[2]${RESET}  ❄    Chill        — ${DIM}iGPU, AI killed, Spotlight off${RESET}"
+    echo -e "  ${BLUE}[3]${RESET}  💻   Programming  — ${DIM}Auto GPU, AI killed, Spotlight on${RESET}"
+    echo -e "  ${RED}[4]${RESET}  ⚡   Beast         — ${DIM}dGPU auto, sleep=0, AI killed${RESET}"
+    echo -e "  ${YELLOW}[5]${RESET}  🕰   Marathon      — ${DIM}iGPU, QoS enforced, stable temps${RESET}"
+    echo -e "  ${MAGENTA}[6]${RESET}  📊   AUDIT         — ${DIM}Battery health, throttle detection, sensor scan${RESET}"
+    echo -e "  ${DIM}[7]${RESET}  📈   Monitor       — ${DIM}Live thermal dashboard${RESET}"
+    echo -e "  ${DIM}[8]${RESET}  🔄   Restore       — ${DIM}Reset to macOS defaults + re-enable radios${RESET}"
+    echo -e "  ${DIM}[0]${RESET}  ✗    Exit"
+    echo ""
+    echo -ne "  ${BOLD}Choice [0-8]:${RESET} "
+    read -r choice
+
+    # Sanitize choice
+    choice="${choice//[^0-8]/}"
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) sep; apply_iceberg ;;
+      2) sep; apply_chill ;;
+      3) sep; apply_programming ;;
+      4) sep; apply_beast ;;
+      5) sep; apply_marathon ;;
+      6) run_audit ;;
+      7) show_monitor ;;
+      8) sep; apply_restore ;;
+      0) echo -e "\n  Goodbye!\n"; cleanup_sudo; exit 0 ;;
+      *) warn "Invalid choice."; sleep 1 ;;
+    esac
+
+    echo ""
+    sep
+    echo -ne "\n  ${DIM}Press Enter to return to menu, or Ctrl+C to exit...${RESET}"
+    read -r
+  done
+}
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+check_platform
+
+# Parse global flags
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run|-n) DRY_RUN=true ;;
+    --status)     show_status; exit 0 ;;
+    --version)    echo "thermal_manager.sh v${VERSION}"; exit 0 ;;
+    --help|-h)    show_help; exit 0 ;;
+  esac
+done
+
+# Strip flags for positional MODE
+# shellcheck disable=SC2048
+for arg in $*; do
+  case "$arg" in
+    iceberg|chill|programming|beast|marathon|audit|monitor|restore)
+      MODE="$arg"
+      break
+      ;;
+  esac
+done
+
+if [[ -n "${MODE:-}" ]]; then
+  # Sudo required for all modes except monitor
+  [[ "$MODE" != "monitor" ]] && require_sudo
+
+  case "$MODE" in
     iceberg)     apply_iceberg ;;
     chill)       apply_chill ;;
     programming) apply_programming ;;
@@ -810,32 +909,7 @@ cli_mode() {
     audit)       run_audit ;;
     monitor)     show_monitor ;;
     restore)     apply_restore ;;
-    *)
-      err "Unknown mode: $1"
-      echo ""
-      echo "  Valid modes: iceberg | chill | programming | beast | marathon | audit | monitor | restore"
-      echo "  Run with --help for full usage guide."
-      exit 1
-      ;;
   esac
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-# --help and --version run before sudo check (no privileges needed)
-if [[ $# -gt 0 ]]; then
-  case "$1" in
-    --help|-h)    show_help; exit 0 ;;
-    --version|-v) echo "thermal_manager.sh v${VERSION}"; exit 0 ;;
-  esac
-fi
-
-check_deps
-require_sudo
-
-if [[ $# -gt 0 ]]; then
-  cli_mode "$1"
 else
   main_menu
 fi

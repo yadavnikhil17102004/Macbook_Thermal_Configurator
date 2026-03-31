@@ -1,8 +1,24 @@
-# Changelog
+## [2.1.0] — 2026-03-31
 
-All notable changes to this project will be documented here.
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
-Versioning follows [Semantic Versioning](https://semver.org/).
+### Added
+- **`--dry-run` / `-n` flag**: Preview all system changes (pmset, launchctl, kill, 
+  defaults, sysctl) without executing them. Intercepted via `xcmd` wrapper.
+- **`--status` flag**: Displays a complete configuration snapshot (GPU, PowerNap, 
+  Standby, Sleep, SMS, UI Motion) without requiring sudo.
+- **`check_platform` guard**: Clean exit if run on non-macOS systems.
+- **Grouped Redirects** in `install.sh`: Optimized shell config modification.
+- **Sudo keepalive ceiling**: Background loop now has an 8-hour limit for security.
+
+### Fixed
+- **Menu recursion fix**: Refactored `main_menu()` from tail-recursion to a `while true` 
+  loop. Prevents stack exhaustion in extended interactive sessions.
+- **ShellCheck Audit (v2.0.1)**: Resolved multiple `SC2015` anti-patterns 
+  (`A && B || C`) by switching to explicit `if/then/else` blocks.
+- **Robustness**: Replaced `(( i++ ))` with `$(( i + 1 ))` for `set -e` compatibility.
+- **Installer Quoting**: Fixed `modes` alias path quoting in `install.sh` to handle 
+  space-y home directories.
+- **CI/CD Security**: Pinned `ludeeus/action-shellcheck` to `@2.0.0` to avoid 
+  unverified `@master` branch updates.
 
 ---
 

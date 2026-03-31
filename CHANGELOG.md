@@ -6,6 +6,43 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.0] — 2026-03-31
+
+### Security
+- **Pin GitHub Actions**: `ludeeus/action-shellcheck@master` → `@2.0.0` to prevent
+  supply-chain attacks from a compromised `master` branch.
+- **Fix stack exhaustion**: `main_menu()` was implemented with unbounded tail recursion
+  (each menu return called `main_menu` again). Replaced with a `while true` loop so
+  the call stack stays constant regardless of how many menu cycles the user goes through.
+- **Add macOS platform guard** (`check_macos`): script now exits cleanly with a clear
+  error if run on a non-Darwin OS, preventing confusing failures on Linux/WSL.
+- **Bound sudo keepalive loop**: the background `sudo -n true` keepalive loop previously
+  ran indefinitely until the EXIT trap fired. It now has an 8-hour ceiling so it cannot
+  persist beyond any reasonable session.
+
+### Added
+- `xcmd()` helper: thin wrapper that either executes a command normally or prints it
+  as `[dry-run] <cmd>` when `DRY_RUN=true`. All state-changing calls in every mode
+  function now route through `xcmd`.
+- `--dry-run` / `-n` flag: run any mode (or the interactive menu) without making any
+  system changes. Prints every command that *would* execute. Sudo is not required.
+  Examples:
+  - `./thermal_manager.sh --dry-run chill`
+  - `sudo ./thermal_manager.sh -n beast`
+  - `./thermal_manager.sh --dry-run` (interactive dry-run menu)
+- `--status` flag: prints a detailed snapshot of current thermal configuration
+  (GPU switch, powernap, standby, hibernatemode, sleep, SMS, reduceMotion,
+  reduceTransparency) without requiring sudo.
+  Example: `./thermal_manager.sh --status`
+- Interactive menu shows a visible `⚠ DRY-RUN mode` banner when launched with
+  `--dry-run`.
+
+### Changed
+- Updated `show_help` to document `--status` and `--dry-run` flags with examples.
+- VERSION bumped from 1.1.0 → 1.2.0.
+
+---
+
 ## [1.1.0] — 2026-03-31
 
 ### Fixed

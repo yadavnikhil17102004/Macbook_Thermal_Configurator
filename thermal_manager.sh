@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  thermal_manager.sh — MacBook Pro A1990 Performance Mode Switcher
-#  Author  : Antigravity (for Nikhil)
+#  Repo    : https://github.com/yadavnikhil17102004/Macbook_Thermal_Configurator
+#  Author  : yadavnikhil17102004
 #  Hardware: Intel i7 / AMD Radeon 555X (A1990)
-#  Requires: sudo, Homebrew, smcFanControl or Macs Fan Control (optional)
+#  Requires: sudo — uses only built-in macOS tools (pmset, launchctl, mdutil)
 # =============================================================================
+
+VERSION="1.1.0"
 
 set -euo pipefail
 
@@ -298,6 +301,56 @@ main_menu() {
   main_menu
 }
 
+# ── --help output ─────────────────────────────────────────────────────────────
+show_help() {
+  cat <<EOF
+
+Mac Thermal Manager v${VERSION}
+https://github.com/yadavnikhil17102004/Macbook_Thermal_Configurator
+
+USAGE:
+  sudo ./thermal_manager.sh [MODE] [OPTIONS]
+
+MODES:
+  (none)        Launch interactive menu
+  chill         ❄  Video / browsing / light work
+                   Forces iGPU, kills PowerNap, pauses Spotlight, reduces UI compositor
+  programming   💻  Code editors, compilers, terminals
+                   Auto GPU, Spotlight on, sleep suppressed
+  beast         ⚡  Max performance — exports, ML, Xcode, large compiles
+                   Auto GPU, sleep=0, Spotlight+TimeMachine off
+  marathon      🕰  Long tasks — stable temps over speed
+                   iGPU only, sleep=0, Siri+GameCenter killed
+  monitor       📊  Live thermal dashboard (CPU temp, GPU power, fan speeds)
+  restore       🔄  Reset ALL settings back to macOS defaults
+
+OPTIONS:
+  --help        Show this help message
+  --version     Show version number
+
+EXAMPLES:
+  sudo ./thermal_manager.sh                 # interactive menu
+  sudo ./thermal_manager.sh chill           # apply Chill mode directly
+  sudo ./thermal_manager.sh beast           # full performance, no prompts
+  sudo ./thermal_manager.sh restore         # undo all changes
+
+ONE-LINER (run directly from GitHub, no download):
+  bash <(curl -fsSL https://raw.githubusercontent.com/yadavnikhil17102004/Macbook_Thermal_Configurator/main/thermal_manager.sh)
+
+INSTALL (sets up 'modes' alias globally):
+  bash <(curl -fsSL https://raw.githubusercontent.com/yadavnikhil17102004/Macbook_Thermal_Configurator/main/install.sh)
+
+DOCS:
+  How it works   : docs/HOW_IT_WORKS.md
+  Troubleshooting: docs/TROUBLESHOOTING.md
+  Changelog      : CHANGELOG.md
+
+Each mode is fully reversible. Run 'restore' to reset everything to macOS defaults.
+Nothing survives a reboot unless you explicitly set it to. No daemons are installed.
+
+EOF
+}
+
 # ── CLI mode (non-interactive / scripted invocation) ─────────────────────────
 cli_mode() {
   case "$1" in
@@ -308,14 +361,24 @@ cli_mode() {
     restore)     apply_restore ;;
     monitor)     show_monitor ;;
     *)
-      echo "Usage: $0 [chill|programming|beast|marathon|restore|monitor]"
-      echo "       $0            (interactive menu)"
+      err "Unknown mode: $1"
+      echo ""
+      echo "  Valid modes: chill | programming | beast | marathon | monitor | restore"
+      echo "  Run with --help for full usage."
       exit 1
       ;;
   esac
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# Handle --help and --version before sudo check (no privileges needed)
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --help|-h)    show_help; exit 0 ;;
+    --version|-v) echo "thermal_manager.sh v${VERSION}"; exit 0 ;;
+  esac
+fi
+
 check_deps
 require_sudo
 

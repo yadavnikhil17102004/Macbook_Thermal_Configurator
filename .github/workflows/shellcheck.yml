@@ -1,0 +1,30 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  shellcheck:
+    name: Lint shell scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck on thermal_manager.sh
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+          additional_files: 'thermal_manager.sh install.sh'
+
+      - name: Check for syntax errors (bash -n)
+        run: |
+          echo "Checking thermal_manager.sh..."
+          bash -n thermal_manager.sh && echo "✓ thermal_manager.sh OK"
+          echo "Checking install.sh..."
+          bash -n install.sh && echo "✓ install.sh OK"

@@ -1,0 +1,22 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Spotlight
+.Spotlight-V100
+.fseventsd
+
+# Thumbnails
+._*
+
+# Logs
+*.log
+
+# Editor junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

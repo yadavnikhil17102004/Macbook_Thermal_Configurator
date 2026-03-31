@@ -31,7 +31,9 @@ KILLED_DAEMONS=()        # Tracks what we killed for the restore summary
 
 # ── Sudo management ───────────────────────────────────────────────────────────
 cleanup_sudo() {
-  [[ -n "${SUDO_KEEPALIVE_PID:-}" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  fi
   sudo -k  # Revoke sudo timestamp on exit
 }
 
@@ -187,7 +189,9 @@ kill_ai_daemons() {
       local new_pids
       new_pids=$(pgrep -x "$daemon" 2>/dev/null || true)
       for pid in $new_pids; do
-        sudo renice 15 "$pid" 2>/dev/null && ok "Reniced ${daemon} (PID ${pid}) → nice=15" || true
+        if sudo renice 15 "$pid" 2>/dev/null; then
+          ok "Reniced ${daemon} (PID ${pid}) → nice=15"
+        fi
       done
     fi
   done
@@ -221,10 +225,10 @@ throttle_background_processes() {
     pids=$(pgrep -if "$proc" 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
       for pid in $pids; do
-        sudo taskpolicy -b -p "$pid" 2>/dev/null && {
+        if sudo taskpolicy -b -p "$pid" 2>/dev/null; then
           ok "Background QoS: ${proc} (PID ${pid})"
           (( throttled++ ))
-        } || true
+        fi
       done
     fi
   done
@@ -255,38 +259,58 @@ kill_spotlight() {
   # Kill running indexers first (immediate heat reduction)
   sudo killall mds mds_stores mdworker_shared 2>/dev/null || true
   sleep 0.5
-  sudo mdutil -a -i off 2>/dev/null && ok "Spotlight indexing disabled (all volumes)." \
-    || warn "Spotlight control limited (SIP may be blocking). Continuing."
+  if sudo mdutil -a -i off 2>/dev/null; then
+    ok "Spotlight indexing disabled (all volumes)."
+  else
+    warn "Spotlight control limited (SIP may be blocking). Continuing."
+  fi
 }
 
 # ── Time Machine — version-aware ─────────────────────────────────────────────
 disable_timemachine() {
   if [[ "$MACOS_VERSION" -ge 12 ]]; then
-    sudo tmutil disable 2>/dev/null && ok "Time Machine disabled." \
-      || warn "tmutil disable unavailable (already off or restricted)."
+    if sudo tmutil disable 2>/dev/null; then
+      ok "Time Machine disabled."
+    else
+      warn "tmutil disable unavailable (already off or restricted)."
+    fi
   else
-    sudo tmutil disablelocal 2>/dev/null || sudo tmutil disable 2>/dev/null \
-      && ok "Time Machine disabled." || warn "tmutil unavailable. Skipping."
+    if sudo tmutil disablelocal 2>/dev/null || sudo tmutil disable 2>/dev/null; then
+      ok "Time Machine disabled."
+    else
+      warn "tmutil unavailable. Skipping."
+    fi
   fi
 }
 
 enable_timemachine() {
-  sudo tmutil enable 2>/dev/null && ok "Time Machine re-enabled." || warn "tmutil enable unavailable."
+  if sudo tmutil enable 2>/dev/null; then
+    ok "Time Machine re-enabled."
+  else
+    warn "tmutil enable unavailable."
+  fi
 }
 
 # ── Radio control (WiFi + Bluetooth) ─────────────────────────────────────────
 disable_radios() {
   # WiFi
   if [[ -n "$WIFI_IF" ]]; then
-    sudo networksetup -setairportpower "$WIFI_IF" off 2>/dev/null \
-      && ok "WiFi disabled (${WIFI_IF})." || warn "Could not disable WiFi."
+    if sudo networksetup -setairportpower "$WIFI_IF" off 2>/dev/null; then
+      ok "WiFi disabled (${WIFI_IF})."
+    else
+      warn "Could not disable WiFi."
+    fi
   else
     warn "WiFi interface not found."
   fi
 
   # Bluetooth (optional — needs blueutil)
   if command -v blueutil &>/dev/null; then
-    blueutil -p 0 && ok "Bluetooth disabled." || warn "blueutil: Bluetooth disable failed."
+    if blueutil -p 0; then
+      ok "Bluetooth disabled."
+    else
+      warn "blueutil: Bluetooth disable failed."
+    fi
   else
     warn "Bluetooth still active. Install blueutil: brew install blueutil"
   fi
@@ -294,24 +318,34 @@ disable_radios() {
 
 enable_radios() {
   if [[ -n "$WIFI_IF" ]]; then
-    sudo networksetup -setairportpower "$WIFI_IF" on 2>/dev/null \
-      && ok "WiFi re-enabled (${WIFI_IF})." || warn "Could not re-enable WiFi."
+    if sudo networksetup -setairportpower "$WIFI_IF" on 2>/dev/null; then
+      ok "WiFi re-enabled (${WIFI_IF})."
+    else
+      warn "Could not re-enable WiFi."
+    fi
   fi
   if command -v blueutil &>/dev/null; then
-    blueutil -p 1 && ok "Bluetooth re-enabled." || true
+    if blueutil -p 1; then
+      ok "Bluetooth re-enabled."
+    fi
   fi
 }
 
 # ── LaunchAgent management ────────────────────────────────────────────────────
 unload_agent() {
   local plist="$1"
-  launchctl unload -w "${plist}" 2>/dev/null && ok "Unloaded: $(basename "$plist" .plist)" \
-    || warn "Could not unload: $(basename "$plist" .plist) (may be SIP-protected or absent)"
+  if launchctl unload -w "${plist}" 2>/dev/null; then
+    ok "Unloaded: $(basename "$plist" .plist)"
+  else
+    warn "Could not unload: $(basename "$plist" .plist) (may be SIP-protected or absent)"
+  fi
 }
 
 load_agent() {
   local plist="$1"
-  launchctl load -w "${plist}" 2>/dev/null && ok "Loaded: $(basename "$plist" .plist)" || true
+  if launchctl load -w "${plist}" 2>/dev/null; then
+    ok "Loaded: $(basename "$plist" .plist)"
+  fi
 }
 
 LA="/System/Library/LaunchAgents"
@@ -355,9 +389,11 @@ apply_iceberg() {
 
   step "10/10" "CPU Turbo hint → Efficiency preference"
   # machdep.xcpm.perf_hint: 0=max perf, 3=balanced/efficiency
-  sudo sysctl -w machdep.xcpm.perf_hint=3 2>/dev/null \
-    && ok "CPU efficiency hint applied." \
-    || warn "machdep.xcpm.perf_hint unavailable on this macOS version."
+  if sudo sysctl -w machdep.xcpm.perf_hint=3 2>/dev/null; then
+    ok "CPU efficiency hint applied."
+  else
+    warn "machdep.xcpm.perf_hint unavailable on this macOS version."
+  fi
 
   echo -e "\n${BLUE}${BOLD}  ❄❄❄  ICEBERG — Maximum cooling active.${RESET}"
   warn "Network is OFFLINE. Run 'restore' to re-enable WiFi."
@@ -415,7 +451,11 @@ apply_programming() {
   ok "Background wakeups suppressed."
 
   step "5/6" "Spotlight → Re-enable (needed for code search)"
-  sudo mdutil -a -i on 2>/dev/null && ok "Spotlight on." || warn "Could not enable Spotlight."
+  if sudo mdutil -a -i on 2>/dev/null; then
+    ok "Spotlight on."
+  else
+    warn "Could not enable Spotlight."
+  fi
 
   step "6/6" "UI Compositor → Balanced"
   defaults write com.apple.universalaccess reduceMotion -bool true
@@ -511,7 +551,11 @@ apply_restore() {
   ok "Power management restored."
 
   step "4/7" "Spotlight → Re-enable"
-  sudo mdutil -a -i on 2>/dev/null && ok "Spotlight indexing on." || warn "Spotlight restore skipped."
+  if sudo mdutil -a -i on 2>/dev/null; then
+    ok "Spotlight indexing on."
+  else
+    warn "Spotlight restore skipped."
+  fi
 
   step "5/7" "Time Machine → Re-enable"
   enable_timemachine
